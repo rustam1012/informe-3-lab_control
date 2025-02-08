@@ -1,0 +1,158 @@
+#include <definitions.h>
+
+// Parametros del lazo de control
+const float h = 0.01;  // tiempo de muestreo en segundos
+const float umin = -5; // valor mínimo de la señal de control
+const float umax = 5; // valor máximo de la señal de control
+const float deadZone = 0.3; // valor estimado de la zona muerta 
+
+// Variables del lazo de control
+float reference; 
+float tau = 0.378;
+float omega_n = 12.5;
+float zita = 0.71;
+float alfa = 1192.518;
+float n = 2;
+float beta = 0;
+float Taw = 0.9 * h;
+float y; // angulo a controlar
+float u; // accion de control
+float e; // error
+float usat; // señal de control saturada
+float kp = (tau * omega_n * omega_n * (2 * zita * n + 1)) / alfa;
+float ki = (n * tau * omega_n * omega_n * omega_n) / alfa ;
+float kd = (tau * omega_n * (2 * zita + n) - 1) / alfa ;
+float bi = ki * h;
+float ad = kd / (kd + n * h);
+float bd = kd * n / (kd + n * h);
+float br = h / Taw;
+// float br = 0;
+float y_ant = y;
+
+// Nueva variable para el integrador no saturado
+float I_unsat;
+
+float P = kp * (beta * reference - y); // compute proportional
+float D = ad * D - bd * (y - y_ant); // compute derivative part
+float I = I + bi * e + br * (usat - u); // compute integral part
+
+void setup() {
+    // iniciamos los perifericos (encoder, led, pwm)
+    setupPeripherals();
+    
+    // Así definimos la tarea de control, de la máxima prioridad en el núcleo 1
+    xTaskCreatePinnedToCore(
+        controlTask, // nombre de la rutina
+        "simple proportional controller",
+        8192,
+        NULL,
+        23, // prioridad de la tarea (0-24), siendo 24 la prioridad más crítica
+        NULL,
+        CORE_1
+    );  
+    
+    // Ahora creamos una tarea para el menú de usuario
+    xTaskCreatePinnedToCore(
+        buttonTask, // nombre de la rutina
+        "activate motor with the buttons",
+        8192,
+        NULL,
+        10,  // definimos una prioridad baja para esta tarea
+        NULL,
+        CORE_0 // la vamos a ejecutar en el CORE_0 que comparte tareas con el procesador, baja prioridad
+    );
+
+    // ponemos el led en verde para indicar que el control está activo
+    setLedColor(0, 255, 0);
+}
+
+/* *************************************************************************
+*                     FUNCION CRITICA DE CONTROL
+***************************************************************************/ 
+
+static void controlTask(void *pvParameters) {
+    // Aquí configuro cada cuánto se repite la tarea
+    const TickType_t taskInterval = 1000 * h;  // repetimos la tarea cada tiempo de muestreo en milisegundos = 1000 * 0.01 = 100 ms
+    
+    // Prototipo de una tarea repetitiva   
+    for (;;) {
+        TickType_t xLastWakeTime = xTaskGetTickCount(); 
+        
+        // Leemos el cambio en el encoder y lo sumamos a la referencia
+        reference +=  encoderKnob.getCount() * pulsesTodegreesKnob; 
+        encoderKnob.clearCount(); // reseteamos el encoder
+   
+        // Leemos el valor actual del ángulo
+        y = encoderMotor.getCount() * pulsesTodegreesMotor;
+       
+        // Calculamos el error       
+        e = reference - y; 
+
+        // Calcular las partes proporcional, derivativa e integral
+        P = kp * (beta * reference - y); // compute proportional
+        D = ad * D - bd * (y - y_ant); // compute derivative part
+        I_unsat = I + bi * e; // compute unsaturated integral part
+
+        // Calculamos la acción de control proporcional
+        u = P + I_unsat + D; 
+
+        // Realizamos la compensación de zona muerta del motor u = u + deadzone * sign(u), si |u| > 0
+        u = compDeadZone(u, deadZone);
+
+        // Saturamos la señal de control para los límites energéticos disponibles entre umin = -5V y umax = 5V
+        usat = constrain(u, umin, umax);
+
+        // Aplicamos la lógica de antiwindup
+        if (u != usat) {
+            I = I; // No actualizamos el integrador si hay saturación
+        } else {
+            I = I_unsat; // Actualizamos el integrador si no hay saturación
+        }
+
+        // Enviamos la señal de control saturada al motor
+        voltsToMotor(usat);  
+        
+        y_ant = y; // actualizamos el valor anterior del ángulo
+
+        // Ahora imprimimos para plotear el funcionamiento del controlador 
+        printf(">Angulo:%.2f, Referencia:%0.2f, min:%d, max:%d \r\n", y, reference, -180, 180);  
+      
+        // La tarea es crítica entonces esperamos exactamente taskInterval ms antes de activarla nuevamente
+        vTaskDelayUntil(&xLastWakeTime, taskInterval);
+    }
+}
+
+/*******************************************************************************/
+// A continuación creamos una tarea de menú de usuario
+
+static void buttonTask(void *pvParameters) {
+    for (;;) {
+        // Si el botón con logo UN supera el umbral, pongo un color naranja 
+        if (touchRead(BUTTON_UN) > threshold){           
+            // Incrementamos la referencia en 90°
+            reference += 720;
+            
+            // Cambiamos el color del LED a azul por 1 segundo para indicar el cambio en la referencia
+            setLedColor(0, 127, 255);
+            vTaskDelay(2000);
+            setLedColor(0, 255, 0);
+        }
+
+        // Si el botón con el dibujo de flor de la vida supera el umbral, pongo un color azul claro 
+        if (touchRead(BUTTON_LIFEFLOWER) > threshold){  
+            // Decrementamos la referencia en 90°           
+            reference -= 720;
+
+            // Cambiamos el color del LED a rojo por 1 segundo para indicar el cambio en la referencia
+            setLedColor(255, 0, 0);
+            vTaskDelay(1000);
+            setLedColor(0, 255, 0);
+        }
+       
+        vTaskDelay(100); // espero 100 ms antes de hacer nuevamente la tarea
+    }
+}
+
+void loop() {
+    vTaskDelete(NULL);
+}
